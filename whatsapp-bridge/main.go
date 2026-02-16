@@ -911,6 +911,54 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// isPhoneNumber checks if a string looks like a phone number (all digits, 10-15 chars)
+func isPhoneNumber(s string) bool {
+	if len(s) < 8 || len(s) > 15 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveContactName tries to get a contact's display name from the WhatsApp client
+func resolveContactName(client *whatsmeow.Client, jidStr string) string {
+	if client == nil || client.Store == nil {
+		return ""
+	}
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return ""
+	}
+
+	// For groups, try group info
+	if jid.Server == "g.us" {
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err == nil && groupInfo.Name != "" {
+			return groupInfo.Name
+		}
+		return ""
+	}
+
+	// For contacts, try the contact store
+	contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+	if err == nil {
+		if contact.FullName != "" {
+			return contact.FullName
+		}
+		if contact.PushName != "" {
+			return contact.PushName
+		}
+		if contact.BusinessName != "" {
+			return contact.BusinessName
+		}
+	}
+	return ""
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, container *sqlstore.Container, messageStore *MessageStore, port int, logger waLog.Logger) {
 	// Serve web UI at root
@@ -1001,6 +1049,35 @@ func startRESTServer(client *whatsmeow.Client, container *sqlstore.Container, me
 			w.WriteHeader(http.StatusInternalServerError)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
+		}
+
+		// Resolve contact names for chat names and senders that are phone numbers
+		nameCache := make(map[string]string)
+		for i, msg := range messages {
+			// Resolve chat name if it looks like a phone number
+			if isPhoneNumber(msg.ChatName) {
+				if resolved, ok := nameCache[msg.ChatName]; ok {
+					messages[i].ChatName = resolved
+				} else if name := resolveContactName(client, msg.ChatJID); name != "" {
+					nameCache[msg.ChatName] = name
+					messages[i].ChatName = name
+					// Also update the chat in DB for future queries
+					messageStore.StoreChat(msg.ChatJID, name, time.Now())
+				}
+			}
+			// Resolve sender if it looks like a phone number
+			if isPhoneNumber(msg.Sender) && !msg.IsFromMe {
+				senderJID := msg.Sender + "@s.whatsapp.net"
+				if resolved, ok := nameCache[msg.Sender]; ok {
+					messages[i].Sender = resolved
+				} else if name := resolveContactName(client, senderJID); name != "" {
+					nameCache[msg.Sender] = name
+					messages[i].Sender = name
+				}
+			}
+			if msg.IsFromMe {
+				messages[i].Sender = "Jarred"
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
