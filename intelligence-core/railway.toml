@@ -1,0 +1,5 @@
+[build]
+dockerfilePath = "intelligence-core/Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
