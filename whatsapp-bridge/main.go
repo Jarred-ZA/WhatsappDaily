@@ -17,11 +17,11 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/mdp/qrterminal"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -47,6 +47,157 @@ var (
 	storeDir         = getEnv("STORE_DIR", "store")
 	bridgeAPIKey     = os.Getenv("BRIDGE_API_KEY")
 )
+
+// Auth state for web-based QR pairing
+var (
+	authMu      sync.RWMutex
+	currentQR   string // current QR code string (empty if none/authenticated)
+	authStatus  string = "initializing"
+	pairCode    string // pair code for phone-based pairing
+)
+
+func setAuthState(status, qr, pair string) {
+	authMu.Lock()
+	defer authMu.Unlock()
+	authStatus = status
+	currentQR = qr
+	pairCode = pair
+}
+
+func getAuthState() (string, string, string) {
+	authMu.RLock()
+	defer authMu.RUnlock()
+	return authStatus, currentQR, pairCode
+}
+
+const authPageHTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WhatsApp Bridge</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0a0a0a; color: #e0e0e0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .container { text-align: center; padding: 2rem; max-width: 500px; }
+  h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #25D366; }
+  .subtitle { color: #888; margin-bottom: 2rem; font-size: 0.9rem; }
+  .status { padding: 1rem; border-radius: 12px; margin-bottom: 1.5rem; font-weight: 500; }
+  .status.connected { background: rgba(37, 211, 102, 0.15); color: #25D366; border: 1px solid rgba(37, 211, 102, 0.3); }
+  .status.waiting { background: rgba(255, 193, 7, 0.15); color: #FFC107; border: 1px solid rgba(255, 193, 7, 0.3); }
+  .status.error { background: rgba(244, 67, 54, 0.15); color: #F44336; border: 1px solid rgba(244, 67, 54, 0.3); }
+  .status.init { background: rgba(100, 100, 100, 0.15); color: #aaa; border: 1px solid rgba(100, 100, 100, 0.3); }
+  #qr-container { background: #fff; padding: 1rem; border-radius: 12px; display: inline-block; margin-bottom: 1.5rem; }
+  #qr-container canvas { display: block; }
+  .pair-code { font-size: 2rem; letter-spacing: 0.5rem; font-weight: 700; color: #25D366; margin: 1rem 0; font-family: monospace; }
+  .instructions { color: #888; font-size: 0.85rem; line-height: 1.6; margin-bottom: 1.5rem; }
+  .btn { background: #25D366; color: #000; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; font-size: 0.9rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn:hover { opacity: 0.85; }
+  .btn.danger { background: #F44336; color: #fff; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .hidden { display: none; }
+  .spinner { display: inline-block; width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #25D366; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 0.5rem; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
+</head>
+<body>
+<div class="container">
+  <h1>WhatsApp Bridge</h1>
+  <p class="subtitle">Daily Summary Service</p>
+
+  <div id="status" class="status init"><span class="spinner"></span> Initializing...</div>
+
+  <div id="qr-section" class="hidden">
+    <div id="qr-container"><canvas id="qr-canvas"></canvas></div>
+    <p class="instructions">Open WhatsApp on your phone<br>Go to Settings > Linked Devices > Link a Device<br>Scan this QR code</p>
+  </div>
+
+  <div id="pair-section" class="hidden">
+    <div class="pair-code" id="pair-code-display"></div>
+    <p class="instructions">Open WhatsApp on your phone<br>Go to Settings > Linked Devices > Link a Device<br>Enter this code instead of scanning</p>
+  </div>
+
+  <div id="connected-section" class="hidden">
+    <p class="instructions" style="margin-bottom: 1rem;">WhatsApp is connected and receiving messages.</p>
+    <button class="btn danger" onclick="reauth()">Disconnect & Re-authenticate</button>
+  </div>
+
+  <div id="reauth-section" class="hidden">
+    <button class="btn" onclick="startAuth()">Generate New QR Code</button>
+  </div>
+</div>
+
+<script>
+let lastQR = '';
+let pollInterval;
+
+async function poll() {
+  try {
+    const res = await fetch('/api/auth/status');
+    const data = await res.json();
+    updateUI(data);
+  } catch(e) {
+    document.getElementById('status').className = 'status error';
+    document.getElementById('status').innerHTML = 'Connection error';
+  }
+}
+
+function updateUI(data) {
+  const statusEl = document.getElementById('status');
+  const qrSection = document.getElementById('qr-section');
+  const pairSection = document.getElementById('pair-section');
+  const connSection = document.getElementById('connected-section');
+  const reauthSection = document.getElementById('reauth-section');
+
+  qrSection.classList.add('hidden');
+  pairSection.classList.add('hidden');
+  connSection.classList.add('hidden');
+  reauthSection.classList.add('hidden');
+
+  if (data.status === 'connected') {
+    statusEl.className = 'status connected';
+    statusEl.innerHTML = 'Connected';
+    connSection.classList.remove('hidden');
+  } else if (data.status === 'waiting_for_qr') {
+    statusEl.className = 'status waiting';
+    statusEl.innerHTML = '<span class="spinner"></span> Waiting for QR scan...';
+    if (data.qr_code && data.qr_code !== lastQR) {
+      lastQR = data.qr_code;
+      QRCode.toCanvas(document.getElementById('qr-canvas'), data.qr_code, { width: 280, margin: 1 });
+    }
+    qrSection.classList.remove('hidden');
+  } else if (data.status === 'waiting_for_pair') {
+    statusEl.className = 'status waiting';
+    statusEl.innerHTML = '<span class="spinner"></span> Waiting for pair code entry...';
+    document.getElementById('pair-code-display').textContent = data.pair_code || '';
+    pairSection.classList.remove('hidden');
+  } else if (data.status === 'logged_out' || data.status === 'disconnected') {
+    statusEl.className = 'status error';
+    statusEl.innerHTML = 'Disconnected';
+    reauthSection.classList.remove('hidden');
+  } else {
+    statusEl.className = 'status init';
+    statusEl.innerHTML = '<span class="spinner"></span> ' + (data.status || 'Initializing...');
+  }
+}
+
+async function reauth() {
+  if (!confirm('This will disconnect WhatsApp. Continue?')) return;
+  await fetch('/api/auth/logout', { method: 'POST' });
+  poll();
+}
+
+async function startAuth() {
+  await fetch('/api/auth/start', { method: 'POST' });
+  poll();
+}
+
+pollInterval = setInterval(poll, 2000);
+poll();
+</script>
+</body>
+</html>`
 
 // checkAPIKey validates the X-API-Key header. Returns true if valid.
 // If BRIDGE_API_KEY is empty (local dev), all requests are allowed.
@@ -761,7 +912,61 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, container *sqlstore.Container, messageStore *MessageStore, port int, logger waLog.Logger) {
+	// Serve web UI at root
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, authPageHTML)
+	})
+
+	// Auth status endpoint (no API key - used by web UI)
+	http.HandleFunc("/api/auth/status", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		status, qr, pair := getAuthState()
+		// Override with live connection status
+		if client.IsConnected() && client.Store.ID != nil {
+			status = "connected"
+		}
+		resp := map[string]string{"status": status}
+		if qr != "" {
+			resp["qr_code"] = qr
+		}
+		if pair != "" {
+			resp["pair_code"] = pair
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Start new auth flow
+	http.HandleFunc("/api/auth/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		go startQRAuth(client, container, messageStore, logger)
+		json.NewEncoder(w).Encode(map[string]string{"status": "starting"})
+	})
+
+	// Logout endpoint
+	http.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		client.Disconnect()
+		if client.Store.ID != nil {
+			client.Logout(context.Background())
+		}
+		setAuthState("logged_out", "", "")
+		json.NewEncoder(w).Encode(map[string]string{"status": "logged_out"})
+	})
+
 	// Health check endpoint (no auth)
 	http.HandleFunc("/api/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -985,9 +1190,41 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// startQRAuth initiates QR-based authentication via the web UI
+func startQRAuth(client *whatsmeow.Client, container *sqlstore.Container, messageStore *MessageStore, logger waLog.Logger) {
+	// Get a fresh device store
+	deviceStore := container.NewDevice()
+	client.Store = deviceStore
+
+	setAuthState("waiting_for_qr", "", "")
+
+	qrChan, _ := client.GetQRChannel(context.Background())
+	err := client.Connect()
+	if err != nil {
+		logger.Errorf("Failed to connect for QR auth: %v", err)
+		setAuthState("error", "", "")
+		return
+	}
+
+	for evt := range qrChan {
+		if evt.Event == "code" {
+			setAuthState("waiting_for_qr", evt.Code, "")
+			logger.Infof("New QR code generated, waiting for scan...")
+		} else if evt.Event == "success" {
+			setAuthState("connected", "", "")
+			logger.Infof("QR auth successful!")
+			return
+		} else if evt.Event == "timeout" {
+			setAuthState("logged_out", "", "")
+			logger.Warnf("QR auth timed out")
+			return
+		}
+	}
+}
+
 func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+	logger.Infof("Starting WhatsApp bridge...")
 
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
@@ -1034,97 +1271,12 @@ func main() {
 			handleHistorySync(client, messageStore, v, logger)
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			setAuthState("connected", "", "")
 		case *events.LoggedOut:
-			logger.Warnf("Device logged out, please scan QR code to log in again")
+			logger.Warnf("Device logged out")
+			setAuthState("logged_out", "", "")
 		}
 	})
-
-	connected := make(chan bool, 1)
-
-	if client.Store.ID == nil {
-		// New client - need to pair
-		pairPhone := os.Getenv("PAIR_PHONE")
-		if pairPhone != "" {
-			// Use pair code for Railway (QR codes may not render in logs)
-			err = client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
-
-			code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
-			if err != nil {
-				logger.Errorf("Failed to get pair code: %v", err)
-				return
-			}
-
-			fmt.Printf("\n========================================\n")
-			fmt.Printf("  PAIR CODE: %s\n", code)
-			fmt.Printf("  Enter this code in WhatsApp on your phone:\n")
-			fmt.Printf("  Settings > Linked Devices > Link a Device\n")
-			fmt.Printf("========================================\n\n")
-
-			// Wait for connection
-			time.Sleep(5 * time.Second)
-			for i := 0; i < 60; i++ {
-				if client.Store.ID != nil {
-					connected <- true
-					break
-				}
-				time.Sleep(5 * time.Second)
-			}
-
-			select {
-			case <-connected:
-				fmt.Println("\nSuccessfully connected and authenticated!")
-			default:
-				logger.Errorf("Timeout waiting for pair code authentication")
-				return
-			}
-		} else {
-			// Use QR code for local development
-			qrChan, _ := client.GetQRChannel(context.Background())
-			err = client.Connect()
-			if err != nil {
-				logger.Errorf("Failed to connect: %v", err)
-				return
-			}
-
-			for evt := range qrChan {
-				if evt.Event == "code" {
-					fmt.Println("\nScan this QR code with your WhatsApp app:")
-					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-				} else if evt.Event == "success" {
-					connected <- true
-					break
-				}
-			}
-
-			select {
-			case <-connected:
-				fmt.Println("\nSuccessfully connected and authenticated!")
-			case <-time.After(3 * time.Minute):
-				logger.Errorf("Timeout waiting for QR code scan")
-				return
-			}
-		}
-	} else {
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-		connected <- true
-	}
-
-	time.Sleep(2 * time.Second)
-
-	if !client.IsConnected() {
-		logger.Errorf("Failed to establish stable connection")
-		return
-	}
-
-	fmt.Println("\nConnected to WhatsApp!")
 
 	// Determine port
 	port := 8080
@@ -1134,12 +1286,61 @@ func main() {
 		}
 	}
 
-	startRESTServer(client, messageStore, port)
+	// Start HTTP server FIRST so web UI is available during auth
+	startRESTServer(client, container, messageStore, port, logger)
+	fmt.Printf("REST server is running on port %d\n", port)
+
+	// Now handle authentication
+	if client.Store.ID == nil {
+		// No existing session - need to authenticate
+		pairPhone := os.Getenv("PAIR_PHONE")
+		if pairPhone != "" {
+			// Use pair code
+			setAuthState("waiting_for_pair", "", "")
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				setAuthState("error", "", "")
+			} else {
+				code, err := client.PairPhone(context.Background(), pairPhone, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+				if err != nil {
+					logger.Errorf("Failed to get pair code: %v", err)
+					setAuthState("error", "", "")
+				} else {
+					setAuthState("waiting_for_pair", "", code)
+					fmt.Printf("\nPAIR CODE: %s\n", code)
+					fmt.Printf("Enter this code on your phone, or visit the web UI.\n\n")
+
+					// Wait for pairing
+					for i := 0; i < 60; i++ {
+						if client.Store.ID != nil {
+							setAuthState("connected", "", "")
+							break
+						}
+						time.Sleep(5 * time.Second)
+					}
+				}
+			}
+		} else {
+			// Use QR code via web UI
+			fmt.Println("\nNo existing session. Open the web UI to scan QR code.")
+			go startQRAuth(client, container, messageStore, logger)
+		}
+	} else {
+		// Existing session - just connect
+		setAuthState("connecting", "", "")
+		err = client.Connect()
+		if err != nil {
+			logger.Errorf("Failed to connect: %v", err)
+			setAuthState("error", "", "")
+		} else {
+			setAuthState("connected", "", "")
+			fmt.Println("Connected to WhatsApp!")
+		}
+	}
 
 	exitChan := make(chan os.Signal, 1)
 	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGTERM)
-
-	fmt.Printf("REST server is running on port %d. Press Ctrl+C to disconnect and exit.\n", port)
 
 	<-exitChan
 
