@@ -41,9 +41,9 @@ func getEnv(key, fallback string) string {
 }
 
 var (
-	whisperModelPath = getEnv("WHISPER_MODEL_PATH", "/Users/jarred.duplessisplatform45.com/whisper-models/ggml-base.en.bin")
-	whisperBinPath   = getEnv("WHISPER_BIN_PATH", "/opt/homebrew/bin/whisper-cli")
-	ffmpegBinPath    = getEnv("FFMPEG_BIN_PATH", "/opt/homebrew/bin/ffmpeg")
+	whisperModelPath = getEnv("WHISPER_MODEL_PATH", "")
+	whisperBinPath   = getEnv("WHISPER_BIN_PATH", "")
+	ffmpegBinPath    = getEnv("FFMPEG_BIN_PATH", "")
 	storeDir         = getEnv("STORE_DIR", "store")
 	bridgeAPIKey     = os.Getenv("BRIDGE_API_KEY")
 )
@@ -989,10 +989,13 @@ func startRESTServer(client *whatsmeow.Client, container *sqlstore.Container, me
 		json.NewEncoder(w).Encode(resp)
 	})
 
-	// Start new auth flow
+	// Start new auth flow (protected - can hijack session)
 	http.HandleFunc("/api/auth/start", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAPIKey(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1000,10 +1003,13 @@ func startRESTServer(client *whatsmeow.Client, container *sqlstore.Container, me
 		json.NewEncoder(w).Encode(map[string]string{"status": "starting"})
 	})
 
-	// Logout endpoint
+	// Logout endpoint (protected - can disconnect session)
 	http.HandleFunc("/api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !checkAPIKey(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

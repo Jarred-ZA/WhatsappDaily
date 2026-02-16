@@ -4,3 +4,4 @@ whatsapp-bridge/whatsapp-bridge
 __pycache__/
 *.pyc
 .env
+.venv/
