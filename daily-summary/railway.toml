@@ -1,5 +1,5 @@
 [build]
-dockerfilePath = "Dockerfile"
+dockerfilePath = "daily-summary/Dockerfile"
 
 [deploy]
 cronSchedule = "0 4 * * *"

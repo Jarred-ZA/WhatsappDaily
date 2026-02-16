@@ -6,11 +6,11 @@ WORKDIR /build
 RUN apt-get update && apt-get install -y gcc libsqlite3-dev && rm -rf /var/lib/apt/lists/*
 
 # Copy go module files first for caching
-COPY go.mod go.sum ./
+COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
 RUN go mod download
 
 # Copy source code
-COPY . .
+COPY whatsapp-bridge/ .
 
 # Build with CGO enabled (required for go-sqlite3)
 RUN CGO_ENABLED=1 go build -o whatsapp-bridge .
